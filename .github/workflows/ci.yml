@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── GCC and Clang, with warnings promoted to errors ──────────────────────────
+  unix:
+    name: ${{ matrix.cxx }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cxx: g++-13
+            cc: gcc-13
+          - os: ubuntu-24.04
+            cxx: clang++-18
+            cc: clang-18
+          - os: macos-14
+            cxx: clang++
+            cc: clang
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CXX: ${{ matrix.cxx }}
+          CC: ${{ matrix.cc }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTESSERA_STRICT=ON -DTESSERA_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke-test the CLI end to end
+        run: |
+          printf 'id,region,units,revenue,created\n1,EU,3,1200.50,2024-01-31\n2,US,7,980.00,2024-02-01\n3,EU,11,2500.25,2024-03-15\n' > sample.csv
+          ./build/tessera info sample.csv
+          ./build/tessera head sample.csv -n 2
+          ./build/tessera query sample.csv "SELECT region, count(*) AS n, sum(revenue) AS total FROM t GROUP BY region ORDER BY region"
+
+  # ── Sanitizers and fuzzing: where latent memory bugs become visible ──────────
+  sanitizers:
+    name: ${{ matrix.cxx }} · ASan + UBSan + fuzz
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [ g++, clang++-18 ]
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: scripts/verify_sanitizers.sh --cases 200 --seed 12345
+
+      - name: Keep any inputs that failed to reproduce
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-reproducers-${{ matrix.cxx }}
+          path: artifacts/fuzz-crashes/
+          if-no-files-found: ignore
+
+  # ── The primary artefact: a native Windows build ─────────────────────────────
+  windows-msvc:
+    name: Windows · MSVC
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTESSERA_STRICT=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke-test the executable
+        shell: pwsh
+        run: |
+          "id,region,units,revenue" | Set-Content sample.csv
+          "1,EU,3,1200.50" | Add-Content sample.csv
+          "2,US,7,980.00" | Add-Content sample.csv
+          .\build\Release\tessera.exe info sample.csv
+          .\build\Release\tessera.exe query sample.csv "SELECT region, sum(revenue) FROM t GROUP BY region"
+
+      - name: Error paths report and exit cleanly
+        shell: pwsh
+        run: |
+          # A build with incomplete exception tables prints "terminating due to
+          # uncaught exception" and exits 3 instead of 1. Link-time optimisation
+          # on MinGW produced exactly that; these checks fail the build if it
+          # ever comes back, on this target as well.
+          $cases = @(
+            @{ args = @('info', 'missing.csv');                     need = 'no such file' },
+            @{ args = @('frobnicate');                               need = 'unknown command' },
+            @{ args = @('export', 'sample.csv', '-f', 'table', '-o', '-'); need = 'unknown output format' },
+            @{ args = @('query', 'sample.csv', 'SELECT nope FROM t'); need = 'unknown column' }
+          )
+          $failed = 0
+          foreach ($case in $cases) {
+            $out = & .\build\Release\tessera.exe @($case.args) 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 1) {
+              Write-Host "FAIL exit $LASTEXITCODE for: $($case.args -join ' ')"
+              $failed++
+            }
+            if ($out -notmatch [regex]::Escape($case.need)) {
+              Write-Host "FAIL message for: $($case.args -join ' ')"
+              $failed++
+            }
+            if ($out -match 'terminating due to uncaught') {
+              Write-Host "FAIL uncaught exception for: $($case.args -join ' ')"
+              $failed++
+            }
+          }
+          if ($failed -gt 0) { throw "$failed error-path check(s) failed" }
+          Write-Host "error paths: exit code 1 with a message, no uncaught exceptions"
+
+      - name: Non-ASCII paths, UTF-8 output and the index cache
+        shell: pwsh
+        run: |
+          # Every path in Tessera is UTF-8 and reaches the OS through the wide
+          # APIs. A regression here silently writes a cache under a mangled name.
+          $name = "donn" + [char]0x00E9 + "es_v" + [char]0x00EA + "ntes.csv"
+          "id;region`n1;Z" + [char]0x00FC + "rich`n2;Lisbon" | Set-Content -Encoding UTF8 $name
+          .\build\Release\tessera.exe info $name | Out-Host
+          .\build\Release\tessera.exe index $name | Out-Host
+          if (-not (Test-Path "$name.tessera.idx")) { throw "sidecar not written under the correct name" }
+
+          # Corrupt the cache: the next open must rescan rather than trust it.
+          [IO.File]::WriteAllText("$name.tessera.idx", "TESSIDX4garbage")
+          $info = .\build\Release\tessera.exe info $name | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "a corrupt cache was fatal" }
+          if ($info -notmatch 'rows\s+2') { throw "a corrupt cache was not ignored: $info" }
+
+          # Piped output is plain, valid UTF-8, with the diamond intact.
+          $piped = .\build\Release\tessera.exe info $name | Out-String
+          if ($piped -match "`e\[") { throw "escape codes in piped output" }
+          if (-not $piped.Contains([char]0x25C6)) { throw "UTF-8 symbol mangled in piped output" }
+          Write-Host "non-ASCII paths, cache recovery and UTF-8 output verified"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-windows-msvc
+          path: build/Release/tessera.exe
+          if-no-files-found: error
+
+  # ── Cross-compiled static .exe, reproducible from any Unix machine ──────────
+  windows-cross:
+    name: Windows · Zig cross-compile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Zig
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.14.1
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          mkdir -p tools
+          tar -xJf zig.tar.xz -C tools
+          mv "tools/zig-linux-x86_64-${ZIG_VERSION}" tools/zig
+          tools/zig/zig version
+
+      - name: Cross-compile
+        env:
+          ZIG: tools/zig/zig
+        run: scripts/build_windows.sh --strict
+
+      - name: Verify the image is a static PE32+ executable
+        run: |
+          set -euo pipefail
+          file dist/tessera.exe
+          python3 scripts/verify_pe.py dist/tessera.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-windows-x86_64
+          path: dist/tessera.exe
+          if-no-files-found: error
+
+  # ── Linux binary for the release page ───────────────────────────────────────
+  linux-binary:
+    name: Linux · static-ish binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Test
+        run: make test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-linux-x86_64
+          path: build/tessera
+          if-no-files-found: error

@@ -1,0 +1,44 @@
+# Normalise everything to LF in the repository, so a Windows checkout and a Linux
+# checkout hold identical bytes. Tessera's data format is the CSV *file*, not the
+# source, so this only affects text.
+* text=auto eol=lf
+
+# Explicit, because a wrong guess here silently corrupts a test corpus.
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+CMakeLists.txt text eol=lf
+Makefile text eol=lf
+
+# Windows shell scripts, if any are ever added, need CRLF to behave.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binaries: never touch, never diff, never merge.
+*.exe binary
+*.dll binary
+*.pdb binary
+*.idx binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.xz binary
+*.tar binary
+
+# Generated or vendored content must not appear in diffs, language stats or
+# GitHub's "linguist" breakdown.
+tools/** linguist-vendored
+docs/*.png linguist-generated
+.github/** linguist-documentation

@@ -1,0 +1,72 @@
+# ── Build output ──────────────────────────────────────────────────────────────
+build/
+build-*/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.a
+*.lib
+*.ilk
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+Testing/
+
+# ── Release artefacts ─────────────────────────────────────────────────────────
+# Prebuilt binaries are attached to GitHub releases, not committed. `make`, CMake
+# or scripts/build_windows.sh recreates them in seconds.
+dist/
+*.pdb
+*.exe
+*.dll
+package/
+*.zip
+*.tar.gz
+
+# ── Generated data and benchmark corpus ───────────────────────────────────────
+# scripts/gen_data.py regenerates any of these byte-for-byte. A 1 GB CSV does not
+# belong in a git object store. The harnesses that produce the numbers do ship:
+# only the corpus they operate on is ignored.
+data/
+bench/*
+!bench/*.py
+!bench/*.sh
+!bench/README.md
+bench-results/
+*.tessera.idx
+*.csv.gz
+
+# ── Vendored toolchains ───────────────────────────────────────────────────────
+# scripts/build_windows.sh can use a Zig toolchain from tools/; it is downloaded,
+# never committed (~400 MB unpacked).
+tools/
+.tools/
+zig.tar.xz
+
+# ── Local rendering scratch ───────────────────────────────────────────────────
+# docs/*.png are the screenshots that ship with the README; artifacts/ is where
+# the snapshot tooling writes during development, including the inputs saved by
+# tests/fuzz_tessera.py when a case fails.
+artifacts/
+fuzz-failure-*.csv
+fuzz-mutation-*.csv
+fuzz-hang-*.csv
+
+# ── Generated package manifests ───────────────────────────────────────────────
+# A winget/Scoop manifest embeds the SHA-256 of the exact release artifact it
+# installs, so these are generated from the published archives by
+# scripts/gen_package_manifests.py and attached to the release. Committing them
+# here would pin hashes of a different build. See packaging/README.md.
+packaging/generated/
+
+# ── Editor and OS noise ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+.cache/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

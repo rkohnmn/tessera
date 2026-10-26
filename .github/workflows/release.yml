@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Windows: the primary artefact ────────────────────────────────────────────
+  windows:
+    name: Windows executable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTESSERA_STRICT=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item build\Release\tessera.exe package\
+          Copy-Item README.md, LICENSE, CHANGELOG.md package\
+          Compress-Archive -Path package\* -DestinationPath tessera-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-windows-x86_64
+          path: tessera-windows-x86_64.zip
+          if-no-files-found: error
+
+  # ── Windows via Zig, checked for the static/system-DLL property ─────────────
+  windows-cross:
+    name: Windows executable (Zig cross-build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Zig
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.14.1
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          mkdir -p tools
+          tar -xJf zig.tar.xz -C tools
+          mv "tools/zig-linux-x86_64-${ZIG_VERSION}" tools/zig
+          tools/zig/zig version
+
+      - name: Cross-compile
+        env:
+          ZIG: tools/zig/zig
+        run: scripts/build_windows.sh --strict
+
+      - name: Verify the PE image
+        run: python3 scripts/verify_pe.py dist/tessera.exe
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp dist/tessera.exe README.md LICENSE CHANGELOG.md package/
+          (cd package && zip -q ../tessera-windows-x86_64-cross.zip *)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessera-windows-x86_64-cross
+          path: tessera-windows-x86_64-cross.zip
+          if-no-files-found: error
+
+  # ── Linux and macOS ─────────────────────────────────────────────────────────
+  unix:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            archive: tessera-linux-x86_64.tar.gz
+          - name: macOS arm64
+            os: macos-14
+            archive: tessera-macos-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTESSERA_STRICT=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp build/tessera README.md LICENSE CHANGELOG.md package/
+          tar -czf "${{ matrix.archive }}" -C package .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  # ── Attach everything to the release ────────────────────────────────────────
+  publish:
+    name: Publish release
+    needs: [ windows, windows-cross, unix ]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          ls -l
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # The package-manager manifests are generated here, from the exact archives
+      # this release publishes, so every hash in them is the hash of a file users
+      # will actually download. They are attached to the release rather than
+      # committed, because a manifest generated on a development machine would
+      # carry the hash of a different build.
+      - name: Generate the winget, Scoop and Homebrew manifests
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 scripts/gen_package_manifests.py \
+            --version "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --windows-zip tessera-windows-x86_64.zip \
+            --linux-tar tessera-linux-x86_64.tar.gz \
+            --macos-tar tessera-macos-arm64.tar.gz \
+            --out packaging/generated
+          (cd packaging/generated && zip -q -r "$GITHUB_WORKSPACE/tessera-$VERSION-package-manifests.zip" .)
+
+      - name: Summarise the submission steps
+        run: |
+          set -euo pipefail
+          {
+            echo "### Package manager manifests"
+            echo
+            echo 'The manifests below were generated from this release'
+            echo 'archives; every SHA-256 in them matches a published file.'
+            echo
+            echo '```sh'
+            echo 'wingetcreate submit --token <PAT> packaging/generated/winget'
+            echo '```'
+            echo
+            echo 'Scoop and Homebrew: see packaging/README.md.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tessera-windows-x86_64.zip
+            tessera-windows-x86_64-cross.zip
+            tessera-linux-x86_64.tar.gz
+            tessera-macos-arm64.tar.gz
+            tessera-*-package-manifests.zip
+            SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
