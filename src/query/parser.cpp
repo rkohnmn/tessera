@@ -574,7 +574,7 @@ private:
         }
 
         if (lexer_.current().kind == TokKind::Punct) {
-            BinOp op;
+            BinOp op = BinOp::Eq;
             bool matched = true;
             const std::string& p = lexer_.current().text;
             if (p == "=" || p == "==") op = BinOp::Eq;

@@ -98,8 +98,6 @@ private:
     std::string pending_;
     std::deque<KeyEvent> queued_;
     bool active_ = false;
-    int cached_width_ = 100;
-    int cached_height_ = 30;
 
 #if defined(TESSERA_WINDOWS)
     void* input_handle_ = nullptr;
@@ -109,7 +107,6 @@ private:
 #else
     struct TermiosState;
     TermiosState* state_ = nullptr;
-    bool saw_resize_ = false;
 #endif
 };
 

@@ -47,7 +47,7 @@ constexpr std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) n
     y -= (m <= 2);
     const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
     const unsigned yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153u * (m + (m > 2 ? -3u : 9u)) + 2u) / 5u + d - 1u;
+    const unsigned doy = (153u * (m > 2 ? m - 3u : m + 9u) + 2u) / 5u + d - 1u;
     const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
     return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
 }
@@ -61,7 +61,7 @@ void civil_from_days(std::int64_t z, std::int64_t& y, unsigned& m, unsigned& d) 
     const unsigned doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
     const unsigned mp = (5u * doy + 2u) / 153u;
     d = doy - (153u * mp + 2u) / 5u + 1u;
-    m = mp + (mp < 10u ? 3u : -9u);
+    m = (mp < 10u ? mp + 3u : mp - 9u);
     y += (m <= 2u);
 }
 

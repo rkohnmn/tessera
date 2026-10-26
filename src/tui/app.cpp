@@ -122,7 +122,7 @@ std::uint64_t App::visible_count() const {
 std::uint64_t App::row_at(std::uint64_t index) const {
     if (identity_view) return std::min(index, dataset->row_count() == 0 ? 0 : dataset->row_count() - 1);
     if (rows.empty()) return 0;
-    return rows[static_cast<std::size_t>(std::min(index, rows.size() - 1))];
+    return rows[static_cast<std::size_t>(std::min<std::uint64_t>(index, rows.size() - 1))];
 }
 
 std::string_view App::cell(std::uint64_t row_index, std::uint32_t column_index) const {

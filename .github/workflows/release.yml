@@ -49,7 +49,7 @@ jobs:
       - name: Fetch Zig
         run: |
           set -euo pipefail
-          ZIG_VERSION=0.14.1
+          ZIG_VERSION=0.14.0
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
           mkdir -p tools
           tar -xJf zig.tar.xz -C tools
