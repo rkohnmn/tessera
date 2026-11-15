@@ -18,9 +18,10 @@ namespace {
 // empty rows that v3 removes. v4 widened the checksum to cover the whole record,
 // not just the payload, so damage to a field that only describes the file is
 // detected instead of going unnoticed. Validation rejects anything it did not
-// write, and an older cache is simply rebuilt.
-constexpr std::array<char, 8> kMagic = {'T', 'E', 'S', 'S', 'I', 'D', 'X', '4'};
-constexpr std::uint32_t kVersion = 4;
+// write, and an older cache is simply rebuilt. v5 invalidates v4 caches made
+// by the parallel indexer, which could retain blank records in large files.
+constexpr std::array<char, 8> kMagic = {'T', 'E', 'S', 'S', 'I', 'D', 'X', '5'};
+constexpr std::uint32_t kVersion = 5;
 
 // magic(8) version(4) data_size(8) mtime(8) header_sig(8) — up to here every
 // byte is compared against the live file, so those need no checksum. Everything

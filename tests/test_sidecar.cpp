@@ -33,7 +33,7 @@ constexpr std::size_t kChecksumFrom = 36;
 constexpr std::size_t kRowCountAt = 44;
 constexpr std::size_t kHeaderSize = 52; // magic..row_count; the payload follows
 constexpr std::size_t kFooterSize = 8;  // trailing checksum
-constexpr std::uint32_t kVersion = 4;
+constexpr std::uint32_t kVersion = 5;
 
 void poke_u64(std::string& bytes, std::size_t at, std::uint64_t value) {
     for (int i = 0; i < 8; ++i) bytes[at + static_cast<std::size_t>(i)] = static_cast<char>((value >> (8 * i)) & 0xFFu);
@@ -63,7 +63,7 @@ void put_varint(std::string& out, std::uint64_t value) {
 std::string forge(std::uint64_t data_size, std::int64_t mtime, std::uint64_t signature, std::uint64_t row_count,
                   std::string_view payload) {
     std::string out;
-    out.append("TESSIDX4", kMagicSize);
+    out.append("TESSIDX5", kMagicSize);
     for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((kVersion >> (8 * i)) & 0xFFu));
     for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((data_size >> (8 * i)) & 0xFFu));
     for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((static_cast<std::uint64_t>(mtime) >> (8 * i)) & 0xFFu));
@@ -100,9 +100,22 @@ TEST(sidecar_layout_constants_still_match_the_reader) {
     CHECK(save_index_cache(path, 500, 42, 0xDEADBEEF, offsets, ';', '"', true));
     const std::string bytes = read_file(index_cache_path(path));
     CHECK_EQ(bytes.size() >= kHeaderSize + kFooterSize, true);
-    CHECK_EQ(bytes.compare(0, kMagicSize, std::string("TESSIDX4")), 0);
+    CHECK_EQ(bytes.compare(0, kMagicSize, std::string("TESSIDX5")), 0);
     CHECK_EQ(static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[kDataSizeAt])), std::uint64_t{500} & 0xFFu);
     CHECK_EQ(static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[kRowCountAt])), std::uint64_t{4});
+}
+
+TEST(sidecar_rejects_v4_offsets_after_parallel_blank_row_fix) {
+    // v4 caches may contain blank records; accepting them would preserve wrong
+    // row counts even after updating the scanner.
+    const std::string path = temp_path("sidecar_legacy_v4.csv");
+    const std::vector<std::uint64_t> offsets{0, 12, 30};
+    CHECK(save_index_cache(path, 100, 42, 123, offsets, ',', '"', true));
+    std::string legacy = read_file(index_cache_path(path));
+    legacy.replace(0, kMagicSize, "TESSIDX4");
+    legacy[8] = static_cast<char>(4);
+    write_file(index_cache_path(path), legacy);
+    CHECK(!load_index_cache(path, 100, 42, 123).has_value());
 }
 
 TEST(sidecar_round_trips_offsets) {

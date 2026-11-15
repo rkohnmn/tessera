@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
+#include <mutex>
 #include <thread>
 
 namespace tess {
@@ -142,7 +144,9 @@ void build_row_index(const char* data, std::uint64_t size, std::uint64_t begin, 
         const std::uint64_t quotes = swar::count_byte(data + begin, data + size, quote);
         if ((quotes & 1u) != 0) {
             // Unbalanced quotes: fall back to the repairing sequential scan.
+            if (cancel != nullptr) cancel->throw_if_canceled();
             build_row_index_sequential(data, size, begin, quote, out, true);
+            if (cancel != nullptr) cancel->throw_if_canceled();
             drop_blank_records(data, size, out);
             stats.repaired_quotes = true;
             stats.rows = out.size();
@@ -153,14 +157,15 @@ void build_row_index(const char* data, std::uint64_t size, std::uint64_t begin, 
     }
 
     if (!parallel) {
+        if (cancel != nullptr) cancel->throw_if_canceled();
         build_row_index_sequential(data, size, begin, quote, out, false);
+        if (cancel != nullptr) cancel->throw_if_canceled();
         drop_blank_records(data, size, out);
-    drop_blank_records(data, size, out);
-    stats.rows = out.size();
-    stats.seconds = now_seconds() - started;
-    if (progress) progress(1.0, "indexing");
-    return;
-}
+        stats.rows = out.size();
+        stats.seconds = now_seconds() - started;
+        if (progress) progress(1.0, "indexing");
+        return;
+    }
 
     // ── Split into chunks aligned to byte boundaries (not records). ───────────
     const std::uint64_t chunk_count_u64 = std::min<std::uint64_t>(
@@ -173,30 +178,59 @@ void build_row_index(const char* data, std::uint64_t size, std::uint64_t begin, 
     }
     bounds[chunk_count] = size;
 
-    // ── Pass 1: quotes per chunk (also warms the page cache). ────────────────
-    std::vector<std::uint64_t> quote_counts(chunk_count, 0);
-    {
+    // Worker exceptions must return to the calling thread. In particular,
+    // CancelToken::throw_if_canceled() may run in a worker; an uncaught exception
+    // there would invoke std::terminate instead of cancelling the scan.
+    auto run_chunks = [&](const auto& process) {
         std::atomic<std::size_t> next{0};
-        std::atomic<std::size_t> done{0};
+        std::atomic<bool> stopped{false};
+        std::exception_ptr first_error;
+        std::mutex error_mutex;
         std::vector<std::thread> pool;
         pool.reserve(std::min<std::size_t>(chunk_count, workers));
         for (unsigned t = 0; t < workers && t < chunk_count; ++t) {
             pool.emplace_back([&] {
-                for (;;) {
-                    const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-                    if (idx >= chunk_count) return;
-                    if (cancel != nullptr) cancel->throw_if_canceled();
-                    quote_counts[idx] = quote == 0 ? 0 : swar::count_byte(data + bounds[idx], data + bounds[idx + 1], quote);
-                    const std::size_t finished = done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (progress) progress(0.5 * static_cast<double>(finished) / static_cast<double>(chunk_count), "indexing");
+                try {
+                    for (;;) {
+                        if (stopped.load(std::memory_order_relaxed)) return;
+                        const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= chunk_count) return;
+                        if (cancel != nullptr) cancel->throw_if_canceled();
+                        process(idx);
+                    }
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(error_mutex);
+                        if (!first_error) first_error = std::current_exception();
+                    }
+                    stopped.store(true, std::memory_order_relaxed);
                 }
             });
         }
-        for (auto& th : pool) {
-            if (th.joinable()) th.join();
-        }
+        for (auto& th : pool) th.join();
+        if (first_error) std::rethrow_exception(first_error);
+        if (cancel != nullptr) cancel->throw_if_canceled();
+    };
+
+    // Progress can be called by different workers; serialize UI callbacks.
+    std::mutex progress_mutex;
+    auto notify = [&](double fraction) {
+        if (!progress) return;
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        progress(fraction, "indexing");
+    };
+
+    // ── Pass 1: quotes per chunk (also warms the page cache). ────────────────
+    std::vector<std::uint64_t> quote_counts(chunk_count, 0);
+    {
+        std::atomic<std::size_t> done{0};
+        run_chunks([&](std::size_t idx) {
+            quote_counts[idx] = quote == 0 ? 0 :
+                swar::count_byte(data + bounds[idx], data + bounds[idx + 1], quote);
+            const std::size_t finished = done.fetch_add(1, std::memory_order_relaxed) + 1;
+            notify(0.5 * static_cast<double>(finished) / static_cast<double>(chunk_count));
+        });
     }
-    if (cancel != nullptr) cancel->throw_if_canceled();
 
     std::vector<bool> starts_in_quote(chunk_count, false);
     std::uint64_t prefix = 0;
@@ -208,31 +242,14 @@ void build_row_index(const char* data, std::uint64_t size, std::uint64_t begin, 
     // ── Pass 2: record starts per chunk, merged in order. ────────────────────
     std::vector<std::vector<std::uint64_t>> per_chunk(chunk_count);
     {
-        std::atomic<std::size_t> next{0};
         std::atomic<std::size_t> done{0};
-        std::vector<std::thread> pool;
-        pool.reserve(std::min<std::size_t>(chunk_count, workers));
-        for (unsigned t = 0; t < workers && t < chunk_count; ++t) {
-            pool.emplace_back([&] {
-                for (;;) {
-                    const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-                    if (idx >= chunk_count) return;
-                    if (cancel != nullptr) cancel->throw_if_canceled();
-                    scan_range(data, size, bounds[idx], bounds[idx + 1], quote, starts_in_quote[idx],
-                               per_chunk[idx]);
-                    const std::size_t finished = done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (progress) {
-                        progress(0.5 + 0.5 * static_cast<double>(finished) / static_cast<double>(chunk_count),
-                                 "indexing");
-                    }
-                }
-            });
-        }
-        for (auto& th : pool) {
-            if (th.joinable()) th.join();
-        }
+        run_chunks([&](std::size_t idx) {
+            scan_range(data, size, bounds[idx], bounds[idx + 1], quote, starts_in_quote[idx],
+                       per_chunk[idx]);
+            const std::size_t finished = done.fetch_add(1, std::memory_order_relaxed) + 1;
+            notify(0.5 + 0.5 * static_cast<double>(finished) / static_cast<double>(chunk_count));
+        });
     }
-    if (cancel != nullptr) cancel->throw_if_canceled();
 
     std::size_t total = 1; // the first record always starts at `begin`
     for (const auto& chunk : per_chunk) total += chunk.size();
@@ -247,6 +264,8 @@ void build_row_index(const char* data, std::uint64_t size, std::uint64_t begin, 
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
     }
+    // Match the sequential scanner: blank physical records are not data rows.
+    drop_blank_records(data, size, out);
 
     stats.rows = out.size();
     stats.seconds = now_seconds() - started;

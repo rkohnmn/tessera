@@ -12,9 +12,14 @@
 
 #include "core/dataset.hpp"
 #include "core/dialect.hpp"
+#include "core/indexer.hpp"
+#include "core/sidecar.hpp"
 #include "core/source.hpp"
 
+#include <cstdio>
+#include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace tess;
@@ -32,6 +37,14 @@ std::shared_ptr<Dataset> open_bytes(const std::string& bytes, const std::string&
 
 std::string cell(const Dataset& dataset, std::uint64_t row, std::uint32_t column) {
     return dataset.decode_cell(row, column);
+}
+
+std::string large_csv_with_blank_records() {
+    std::string text = "id,note\n";
+    const std::string record = "1," + std::string(40, 'x') + "\n\n";
+    text.reserve(text.size() + record.size() * 100000);
+    for (int i = 0; i < 100000; ++i) text += record;
+    return text; // > 4 MiB, forcing the parallel path with 4 workers
 }
 
 } // namespace
@@ -155,6 +168,66 @@ TEST(edge_blank_records_are_skipped) {
     const auto leading = open_bytes("\n\nid,name\n1,alpha\n", "edge_blank_lead.csv");
     CHECK_EQ(leading->row_count(), std::uint64_t{1});
     CHECK_EQ(std::string(leading->column_name(0)), std::string("id"));
+}
+
+TEST(edge_parallel_index_matches_sequential_blank_filtering) {
+    const std::string text = large_csv_with_blank_records();
+    std::vector<std::uint64_t> sequential;
+    std::vector<std::uint64_t> parallel;
+    IndexStats sequential_stats;
+    IndexStats parallel_stats;
+    build_row_index(text.data(), text.size(), 0, '"', 1, nullptr, {}, sequential, sequential_stats);
+    build_row_index(text.data(), text.size(), 0, '"', 4, nullptr, {}, parallel, parallel_stats);
+    CHECK_EQ(sequential.size(), std::size_t{100001}); // header + data; no blank rows
+    CHECK(parallel == sequential);
+    CHECK_EQ(parallel_stats.rows, sequential_stats.rows);
+}
+
+TEST(edge_parallel_cancellation_is_catchable) {
+    const std::string text = large_csv_with_blank_records();
+    CancelToken token;
+    token.cancel();
+    std::vector<std::uint64_t> offsets;
+    IndexStats stats;
+    bool caught = false;
+    try {
+        build_row_index(text.data(), text.size(), 0, '"', 4, &token, {}, offsets, stats);
+    } catch (const Canceled&) {
+        caught = true;
+    }
+    CHECK(caught); // must not invoke std::terminate on a worker thread
+}
+
+TEST(edge_parallel_progress_exception_reaches_caller) {
+    const std::string text = large_csv_with_blank_records();
+    std::vector<std::uint64_t> offsets;
+    IndexStats stats;
+    bool caught = false;
+    const ProgressFn progress = [](double, std::string_view) {
+        throw Error("progress callback failed");
+    };
+    try {
+        build_row_index(text.data(), text.size(), 0, '"', 4, nullptr, progress, offsets, stats);
+    } catch (const Error&) {
+        caught = true;
+    }
+    CHECK(caught);
+}
+
+TEST(edge_large_file_blank_rows_stay_filtered_after_sidecar_reload) {
+    const std::string path = temp_path("edge_parallel_blank_sidecar.csv");
+    write_file(path, large_csv_with_blank_records());
+    OpenOptions options;
+    options.threads = 4;
+    options.use_sidecar = true;
+    options.write_sidecar = true;
+    const auto first = Dataset::open(path, options);
+    CHECK_EQ(first->row_count(), std::uint64_t{100000});
+    const auto second = Dataset::open(path, options);
+    CHECK_EQ(second->row_count(), std::uint64_t{100000});
+    CHECK(second->info().index_from_sidecar);
+    std::remove(path.c_str());
+    std::remove(index_cache_path(path).c_str());
 }
 
 TEST(edge_duplicate_header_names_are_made_unique) {
