@@ -89,7 +89,7 @@ jobs:
             os: ubuntu-24.04
             archive: tessera-linux-x86_64.tar.gz
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             archive: tessera-macos-arm64.tar.gz
     steps:
       - uses: actions/checkout@v4
